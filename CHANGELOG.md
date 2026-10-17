@@ -2,7 +2,7 @@
 
 All notable changes. Versions are git tags; each tag has a Forgejo release with checksums.
 
-## Unreleased
+## 1.2.1 - 2026-10-17
 
 - Day-of-month/day-of-week matching now follows Vixie cron/cronie exactly: a day field that *starts with* `*` (e.g. `*/2`) makes cron AND the two fields, so `0 0 */2 * 1` runs only on odd-dated Mondays. Next-run times, the OR warning, never-fires detection and descriptions were wrong for these schedules.
 - Overlap detection follows the same day rule, so `0 0 1 * 1` (the 1st OR any Monday) now overlaps `0 0 2 * *`; it used to be missed.

@@ -35,7 +35,7 @@ A plain `crontab -e` syntax check won't catch any of these — this tool does:
 
 ```sh
 pipx install git+https://git.canutethegreat.com/CanuteTheGreat/cron-sanity-checker.git        # latest release branch; puts `cron-sanity-checker` on PATH
-pipx install git+https://git.canutethegreat.com/CanuteTheGreat/cron-sanity-checker.git@v1.2.0  # a pinned release
+pipx install git+https://git.canutethegreat.com/CanuteTheGreat/cron-sanity-checker.git@v1.2.1  # a pinned release
 brew install canutethegreat/errant-tools/cron-sanity-checker   # after: brew tap canutethegreat/errant-tools https://git.canutethegreat.com/CanuteTheGreat/homebrew-errant-tools
 scoop install errant-tools/cron-sanity-checker                 # after: scoop bucket add errant-tools https://git.canutethegreat.com/CanuteTheGreat/scoop-errant-tools
 ```

@@ -35,7 +35,7 @@ Exit codes: 0 = no errors (warnings still possible), 1 = at least one error foun
 (or no job lines), 2 = usage error (no input, unreadable --file, bad --from).
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import argparse
 import calendar
