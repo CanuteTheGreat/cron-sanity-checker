@@ -40,4 +40,9 @@ path = "cron_sanity_checker.py"
 only-include = ["cron_sanity_checker.py"]
 
 [tool.hatch.build.targets.sdist]
-only-include = ["cron_sanity_checker.py", "README.md", "LICENSE", "CHANGELOG.md", "tests"]
+only-include = ["cron_sanity_checker.py", "README.md", "LICENSE", "CHANGELOG.md", "tests", "claims.json"]
+
+[tool.mutmut]
+source_paths = ["cron_sanity_checker.py"]
+pytest_add_cli_args_test_selection = ["tests/"]
+also_copy = ["claims.json", "README.md", "CHANGELOG.md"]

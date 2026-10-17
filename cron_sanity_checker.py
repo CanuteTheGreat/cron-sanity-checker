@@ -78,6 +78,21 @@ class CronFieldError(ValueError):
     pass
 
 
+def day_field_restricted(raw):
+    """Vixie cron / cronie semantics: a day-of-month or day-of-week field counts as
+    restricted unless its first character is '*' (so '*/2' is NOT restricted). When both
+    day fields are restricted, a day matches if EITHER matches; otherwise both must match."""
+    return not raw.strip().startswith("*")
+
+
+def day_matches(dom, dow, expanded, dom_restricted, dow_restricted):
+    dom_match = dom in expanded["day-of-month"]
+    dow_match = dow in expanded["day-of-week"]
+    if dom_restricted and dow_restricted:
+        return dom_match or dow_match
+    return dom_match and dow_match
+
+
 def normalize_token(tok, aliases):
     low = tok.lower()
     for name, val in aliases.items():
@@ -252,8 +267,8 @@ def analyze_line(raw_line, line_no, results):
         expanded[name] = expand_field_with_step(raw, name, lo, hi, errors)
 
     dom_raw, month_raw, dow_raw = fields[2], fields[3], fields[4]
-    dom_restricted = dom_raw.strip() != "*"
-    dow_restricted = dow_raw.strip() != "*"
+    dom_restricted = day_field_restricted(dom_raw)
+    dow_restricted = day_field_restricted(dow_raw)
 
     if dom_restricted and dow_restricted:
         warnings.append(
@@ -296,7 +311,8 @@ def analyze_line(raw_line, line_no, results):
                             f"this job fires once every four years")
 
     if any(errors):
-        results["errors"].extend(errors)
+        # field errors carry the crontab line, like every other finding
+        results["errors"].extend(e if e.startswith("line ") else f"line {line_no}: {e}" for e in errors)
     if warnings:
         results["warnings"].extend(warnings)
 
@@ -313,14 +329,21 @@ def compute_overlaps(jobs, results):
     """Warn if two+ distinct jobs share an identical (minute,hour,dom,month,dow)
     expansion intersection that is non-empty and non-trivial, indicating they
     could fire at the same wall-clock minute."""
+    def fire_days(job):
+        # every (month, day, weekday) the job fires on; each valid month/day falls on every
+        # weekday in some year, so two jobs share a day iff these sets intersect
+        if "fire_days" not in job:
+            exp, f = job["expanded"], job["fields"]
+            r_dom, r_dow = day_field_restricted(f[2]), day_field_restricted(f[4])
+            job["fire_days"] = {(mo, d, w) for mo in exp["month"] for d in range(1, DAYS_IN_MONTH_MAX[mo] + 1)
+                                for w in range(7) if day_matches(d, w, exp, r_dom, r_dow)}
+        return job["fire_days"]
+
     def could_fire_same_minute(a, b):
-        for name, _, _ in FIELD_SPECS:
-            sa, sb = a["expanded"].get(name, set()), b["expanded"].get(name, set())
-            if not sa or not sb:
+        for name in ("minute", "hour"):
+            if a["expanded"][name].isdisjoint(b["expanded"][name]):
                 return False
-            if sa.isdisjoint(sb):
-                return False
-        return True
+        return not fire_days(a).isdisjoint(fire_days(b))
 
     n = len(jobs)
     for i in range(n):
@@ -349,9 +372,8 @@ def next_n_runs(fields, n, start=None):
     for (name, lo, hi), raw in zip(FIELD_SPECS, fields):
         expanded[name] = expand_field_with_step(raw, name, lo, hi, [])
 
-    dom_raw, dow_raw = fields[2], fields[4]
-    dom_restricted = dom_raw.strip() != "*"
-    dow_restricted = dow_raw.strip() != "*"
+    dom_restricted = day_field_restricted(fields[2])
+    dow_restricted = day_field_restricted(fields[4])
     minutes = sorted(expanded["minute"])
     hours = sorted(expanded["hour"])
 
@@ -363,16 +385,7 @@ def next_n_runs(fields, n, start=None):
 
     while day < last_day and len(found) < n:
         dow = day.isoweekday() % 7  # Sunday=0 .. Saturday=6
-        dom_match = day.day in expanded["day-of-month"]
-        dow_match = dow in expanded["day-of-week"]
-        if dom_restricted and dow_restricted:
-            day_ok = dom_match or dow_match
-        elif dom_restricted:
-            day_ok = dom_match
-        elif dow_restricted:
-            day_ok = dow_match
-        else:
-            day_ok = True
+        day_ok = day_matches(day.day, dow, expanded, dom_restricted, dow_restricted)
 
         if day_ok and day.month in expanded["month"]:
             for hr in hours:
@@ -421,12 +434,13 @@ def _list(values, name=str, through=" through "):
     return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
-def _step_of(raw, lo):
-    """'*/15' -> 15, '0-59/15' -> 15 when it starts at the field minimum; else None."""
+def _step_of(raw, lo, hi):
+    """'*/15', '0/15' or '0-59/15' -> 15 (a step over the whole field); else None
+    ('0-30/15' only covers part of the hour, so it is described by its values)."""
     if "," in raw or "/" not in raw:
         return None
     base, step = raw.split("/", 1)
-    if base in ("*", str(lo)) or base == "%d-%s" % (lo, base.split("-")[-1]):
+    if base in ("*", str(lo), "%d-%d" % (lo, hi)):
         try:
             return int(step)
         except ValueError:
@@ -447,7 +461,7 @@ def describe(fields):
     elif m_raw == "*":
         when = "every minute during hour " + _list(hours, lambda h: "%02d:00" % h)
     elif h_raw == "*":
-        step = _step_of(m_raw, 0)
+        step = _step_of(m_raw, 0, 59)
         if step:
             when = "every %d minutes" % step if step > 1 else "every minute"
         elif minutes == [0]:
@@ -458,19 +472,20 @@ def describe(fields):
         when = "at " + _list([h * 60 + m for h in hours for m in minutes],
                              lambda t: "%02d:%02d" % divmod(t, 60), through=" through ")
     else:
-        step = _step_of(m_raw, 0)
+        step = _step_of(m_raw, 0, 59)
         mins = ("every %d minutes" % step) if step else ("at minute " + _list(minutes))
-        hstep = _step_of(h_raw, 0)
+        hstep = _step_of(h_raw, 0, 23)
         hrs = ("every %d hours" % hstep) if hstep else ("past hour " + _list(hours))
         when = "%s %s" % (mins, hrs)
 
     days = []
-    dom_r, dow_r = dom_raw != "*", dow_raw != "*"
-    if dom_r:
+    if dom_raw != "*":
         days.append("on the " + _list(exp["day-of-month"], _ordinal) + " of the month")
-    if dow_r:
+    if dow_raw != "*":
         days.append("on " + _list(exp["day-of-week"], lambda d: DOW_NAMES[d]))
-    text = when + (" " + " or ".join(days) if days else "")
+    # cron ORs the day fields only when neither starts with '*' (e.g. '*/2' ANDs)
+    joiner = " or " if day_field_restricted(dom_raw) and day_field_restricted(dow_raw) else " and only "
+    text = when + (" " + joiner.join(days) if days else "")
     if mon_raw != "*":
         text += " in " + _list(exp["month"], lambda m: MONTH_NAMES[m])
     return text[0].upper() + text[1:]
