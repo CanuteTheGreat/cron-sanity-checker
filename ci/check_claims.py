@@ -4,7 +4,7 @@
     python3 ci/check_claims.py            # run by ci/run-tests.sh (fails CI on any gap)
 
 claims.json:
-  {"claims": [{"id": "...", "text": "<exact phrase from README.md>",
+  {"claims": [{"id": "...", "text": "<exact phrase from README.md>", "also": ["<more phrases>"],
                "flags": ["--json", ...],                 # README options this claim covers
                "tests": ["tests/test_x.py::TestClass::test_method",
                          ".forgejo/workflows/test.yml#<text that must be in the file>",
@@ -13,7 +13,8 @@ claims.json:
 It fails when
   * a claim's text no longer appears in README.md (README changed, ledger not),
   * a claim names no test, or a named test file/class/method (or CI file text) doesn't exist,
-  * the README makes a claim that is not in the ledger: a feature bullet (`- **Name**`),
+  * the README makes a claim that is not in the ledger: a feature bullet (any top-level `- `
+    line outside Install/License/Tests/Why sections; matched by its bold lead-in or first line),
     a `--option` anywhere in the README, or the exit-code contract.
 The test suite itself runs in the same CI job and fails on any failing/skipped test, so
 "exists" here plus a green suite means "proven".
@@ -92,7 +93,18 @@ def test_exists(ref, cache):
 
 def readme_claims(readme):
     """Things in the README that are claims and must be in the ledger."""
-    bullets = re.findall(r"^\s*[-*] \*\*(.+?)\*\*", readme, re.M)
+    # every top-level bullet outside the install/license/tests/background sections is a claim;
+    # it is identified by its bold lead-in, else by its first line
+    skip = re.compile(r"(?i)^#+ *(install|license|licen[cs]e / pricing|tests|why|pricing|support)\b")
+    bullets, section_skipped = [], False
+    for line in readme.splitlines():
+        if line.startswith("#"):
+            section_skipped = bool(skip.match(line))
+            continue
+        if section_skipped or not re.match(r"^[-*] ", line):
+            continue
+        m = re.match(r"^[-*] \*\*(.+?)\*\*", line)
+        bullets.append(m.group(1) if m else line[2:].strip())
     flags = set(re.findall(r"(?<![\w-])(--[a-z][a-z0-9-]*)", readme))
     # install commands' own options are not claims about this tool
     install = re.search(r"^## Install\b.*?(?=^## )", readme, re.M | re.S)
@@ -118,9 +130,10 @@ def main():
             problems.append("duplicate claim id %s" % cid)
         ids.add(cid)
         text = c.get("text", "")
-        if not text or norm(text) not in nreadme:
-            problems.append("claim %s: text not found in README.md: %r" % (cid, text))
-        covered_text.append(norm(text))
+        for t in [text] + c.get("also", []):
+            if not t or norm(t) not in nreadme:
+                problems.append("claim %s: text not found in README.md: %r" % (cid, t))
+            covered_text.append(norm(t))
         covered_flags.update(c.get("flags", []))
         if cid == "exit-codes":
             exit_ok = True
