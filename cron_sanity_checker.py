@@ -35,10 +35,15 @@ Exit codes: 0 = no errors (warnings still possible), 1 = at least one error foun
 (or no job lines), 2 = usage error (no input, unreadable --file, bad --from).
 """
 
+__version__ = "1.2.0"
+
 import argparse
-import sys
-import datetime
 import calendar
+import datetime
+import json
+import os
+import re
+import sys
 
 FIELD_SPECS = [
     ("minute", 0, 59),
@@ -323,6 +328,8 @@ def compute_overlaps(jobs, results):
             a, b = jobs[i], jobs[j]
             if a["has_errors"] or b["has_errors"]:
                 continue
+            if a.get("tz") != b.get("tz"):
+                continue  # same wall-clock fields in different zones are different instants
             if could_fire_same_minute(a, b):
                 results["warnings"].append(
                     f"lines {a['line_no']} and {b['line_no']}: schedules overlap "
@@ -380,35 +387,280 @@ def next_n_runs(fields, n, start=None):
     return found
 
 
-def main():
+# --------------------------------------------------------------------------- plain-English description
+
+DOW_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June", "July", "August",
+               "September", "October", "November", "December"]
+
+
+def _ordinal(n):
+    return "%d%s" % (n, "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th"))
+
+
+def _runs(values):
+    """[1,2,3,5] -> [(1,3),(5,5)]"""
+    out = []
+    for v in sorted(values):
+        if out and v == out[-1][1] + 1:
+            out[-1] = (out[-1][0], v)
+        else:
+            out.append((v, v))
+    return out
+
+
+def _list(values, name=str, through=" through "):
+    parts = []
+    for a, b in _runs(values):
+        if a == b:
+            parts.append(name(a))
+        elif b == a + 1:
+            parts += [name(a), name(b)]
+        else:
+            parts.append(name(a) + through + name(b))
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _step_of(raw, lo):
+    """'*/15' -> 15, '0-59/15' -> 15 when it starts at the field minimum; else None."""
+    if "," in raw or "/" not in raw:
+        return None
+    base, step = raw.split("/", 1)
+    if base in ("*", str(lo)) or base == "%d-%s" % (lo, base.split("-")[-1]):
+        try:
+            return int(step)
+        except ValueError:
+            return None
+    return None
+
+
+def describe(fields):
+    """Plain-English description of a 5-field schedule, crontab.guru style."""
+    exp = {name: expand_field_with_step(raw, name, lo, hi, []) for (name, lo, hi), raw in zip(FIELD_SPECS, fields)}
+    if not all(exp.values()):
+        return None  # unparseable field: nothing sensible to say
+    m_raw, h_raw, dom_raw, mon_raw, dow_raw = [f.strip() for f in fields]
+    minutes, hours = sorted(exp["minute"]), sorted(exp["hour"])
+
+    if m_raw == "*" and h_raw == "*":
+        when = "every minute"
+    elif m_raw == "*":
+        when = "every minute during hour " + _list(hours, lambda h: "%02d:00" % h)
+    elif h_raw == "*":
+        step = _step_of(m_raw, 0)
+        if step:
+            when = "every %d minutes" % step if step > 1 else "every minute"
+        elif minutes == [0]:
+            when = "every hour, on the hour"
+        else:
+            when = "at minute " + _list(minutes) + " past every hour"
+    elif len(minutes) * len(hours) <= 6:
+        when = "at " + _list([h * 60 + m for h in hours for m in minutes],
+                             lambda t: "%02d:%02d" % divmod(t, 60), through=" through ")
+    else:
+        step = _step_of(m_raw, 0)
+        mins = ("every %d minutes" % step) if step else ("at minute " + _list(minutes))
+        hstep = _step_of(h_raw, 0)
+        hrs = ("every %d hours" % hstep) if hstep else ("past hour " + _list(hours))
+        when = "%s %s" % (mins, hrs)
+
+    days = []
+    dom_r, dow_r = dom_raw != "*", dow_raw != "*"
+    if dom_r:
+        days.append("on the " + _list(exp["day-of-month"], _ordinal) + " of the month")
+    if dow_r:
+        days.append("on " + _list(exp["day-of-week"], lambda d: DOW_NAMES[d]))
+    text = when + (" " + " or ".join(days) if days else "")
+    if mon_raw != "*":
+        text += " in " + _list(exp["month"], lambda m: MONTH_NAMES[m])
+    return text[0].upper() + text[1:]
+
+
+# --------------------------------------------------------------------------- systemd OnCalendar
+
+ONCALENDAR_SHORTHANDS = {
+    "minutely": "*-*-* *:*:00", "hourly": "*-*-* *:00:00", "daily": "*-*-* 00:00:00",
+    "monthly": "*-*-01 00:00:00", "weekly": "Mon *-*-* 00:00:00", "yearly": "*-01-01 00:00:00",
+    "annually": "*-01-01 00:00:00", "quarterly": "*-01,04,07,10-01 00:00:00",
+    "semiannually": "*-01,07-01 00:00:00",
+}
+SD_DOW = {"mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "sun": 0}
+
+
+SD_MAX = {"minute": 59, "hour": 23, "day": 31, "month": 12}
+
+
+def _sd_component(part, what):
+    """systemd list/range/step syntax ('1,3', '1..5', '*/15', '0/15') -> cron syntax."""
+    out = []
+    for item in part.split(","):
+        if item.startswith("*") and "/" in item:
+            out.append("*/" + item.split("/", 1)[1])
+        elif "/" in item:
+            base, step = item.split("/", 1)
+            out.append("%d-%d/%d" % (int(base), SD_MAX[what], int(step)))
+        elif ".." in item:
+            a, b = item.split("..", 1)
+            out.append("%d-%d" % (int(a), int(b)))
+        elif item == "*":
+            out.append("*")
+        else:
+            if "~" in item:
+                raise CronFieldError("'~' (last day of month) in OnCalendar %s has no cron equivalent" % what)
+            out.append(str(int(item)))
+    return ",".join(out)
+
+
+def oncalendar_to_cron(spec):
+    """Translate a systemd OnCalendar= expression into the equivalent 5-field cron schedule.
+    Raises CronFieldError for parts cron can't express (seconds other than 0, years, '~')."""
+    s = " ".join(spec.strip().split())
+    low = s.lower()
+    if low in ONCALENDAR_SHORTHANDS:
+        s = ONCALENDAR_SHORTHANDS[low]
+    tokens = s.split(" ")
+    dow = "*"
+    if tokens and tokens[0][:1].isalpha():
+        names = []
+        for item in tokens.pop(0).split(","):
+            ends = item.split("..")
+            vals = [SD_DOW.get(e[:3].lower()) for e in ends]
+            if None in vals:
+                raise CronFieldError("unknown OnCalendar weekday '%s'" % item)
+            names.append("%d-%d" % tuple(vals) if len(vals) == 2 else str(vals[0]))
+        dow = ",".join(names)
+    date, time_ = "*-*-*", "00:00:00"
+    for t in tokens:
+        if ":" in t:
+            time_ = t
+        elif "-" in t:
+            date = t
+        elif t:
+            raise CronFieldError("can't parse OnCalendar part '%s'" % t)
+    d = date.split("-")
+    if len(d) == 2:
+        d = ["*"] + d
+    if len(d) != 3:
+        raise CronFieldError("OnCalendar date must look like [YYYY-]MM-DD, got '%s'" % date)
+    if d[0] != "*":
+        raise CronFieldError("OnCalendar year '%s' has no cron equivalent" % d[0])
+    tm = time_.split(":")
+    if len(tm) == 2:
+        tm.append("00")
+    if len(tm) != 3:
+        raise CronFieldError("OnCalendar time must look like HH:MM[:SS], got '%s'" % time_)
+    if tm[2] not in ("00", "0"):
+        raise CronFieldError("OnCalendar seconds '%s' can't be expressed in cron (minute resolution)" % tm[2])
+    try:
+        fields = [_sd_component(tm[1], "minute"), _sd_component(tm[0], "hour"), _sd_component(d[2], "day"),
+                  _sd_component(d[1], "month"), dow]
+    except ValueError as e:
+        raise CronFieldError("can't parse OnCalendar '%s': %s" % (spec, e))
+    return " ".join(fields)
+
+
+# --------------------------------------------------------------------------- time zones / DST
+
+def load_zone(name):
+    """zoneinfo.ZoneInfo(name), or None when Python < 3.9 / tzdata missing."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def dst_issues(fields, zone, start=None, days=400):
+    """Scheduled local times that fall into a DST gap (don't exist) or overlap (happen twice)
+    in `zone` within `days` days. Returns a list of (kind, naive datetime)."""
+    exp = {n: expand_field_with_step(raw, n, lo, hi, []) for (n, lo, hi), raw in zip(FIELD_SPECS, fields)}
+    utc = datetime.timezone.utc
+    day = (start or datetime.datetime.now()).date()
+    issues = []
+
+    def offset(dt, fold):
+        return dt.replace(tzinfo=zone, fold=fold).utcoffset()
+
+    prev = offset(datetime.datetime(day.year, day.month, day.day, 12), 0)
+    for _ in range(days):
+        day += datetime.timedelta(days=1)
+        noon = offset(datetime.datetime(day.year, day.month, day.day, 12), 0)
+        if noon != prev or offset(datetime.datetime(day.year, day.month, day.day, 0), 0) != noon:
+            # a transition happened on this day (or the previous night): check the scheduled minutes
+            # (dom/dow/month matching is the same as next_n_runs)
+            sched = next_n_runs(fields, 1440, start=datetime.datetime(day.year, day.month, day.day) -
+                                datetime.timedelta(minutes=1))
+            for t in sched:
+                if t.date() != day:
+                    break
+                aware0, aware1 = t.replace(tzinfo=zone, fold=0), t.replace(tzinfo=zone, fold=1)
+                back = aware0.astimezone(utc).astimezone(zone).replace(tzinfo=None)
+                if back != t:
+                    issues.append(("gap", t))
+                elif aware0.utcoffset() != aware1.utcoffset():
+                    issues.append(("overlap", t))
+        prev = noon
+    return issues
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Sanity-check cron schedule expressions for common footguns.")
+        prog="cron-sanity-checker",
+        description="Sanity-check cron schedule expressions for common footguns.",
+        epilog="Exit codes: 0 no errors (warnings possible), 1 at least one error (or no job lines), 2 usage error.")
+    ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     ap.add_argument("expression", nargs="?",
-                     help="A single cron expression, quoted, e.g. '*/5 * * * *' "
-                          "(command portion optional — dummy 'noop' is appended "
-                          "if you only pass 5 fields)")
-    ap.add_argument("--file", help="Path to a crontab-style file (one job per line)")
+                    help="A single cron expression, quoted, e.g. '*/5 * * * *' "
+                         "(command portion optional -- dummy 'noop' is appended "
+                         "if you only pass 5 fields)")
+    ap.add_argument("--file", help="Path to a crontab-style file (one job per line; CRON_TZ=/TZ= lines set the "
+                                   "time zone for the lines after them)")
+    ap.add_argument("--oncalendar", metavar="SPEC",
+                    help="check a systemd timer OnCalendar= expression instead (e.g. 'Mon..Fri *-*-* 02:30')")
+    ap.add_argument("--tz", metavar="ZONE",
+                    help="IANA time zone the schedule runs in (e.g. America/New_York): enables DST gap/overlap "
+                         "warnings (default: CRON_TZ/TZ lines in --file, else $TZ)")
     ap.add_argument("--show-next", type=int, metavar="N", default=0,
-                     help="Show the next N computed run times for each valid job "
-                          "(searches up to 30 years ahead)")
+                    help="Show the next N computed run times for each valid job "
+                         "(searches up to 30 years ahead)")
     ap.add_argument("--from", dest="start", metavar="'YYYY-MM-DD HH:MM'",
-                     help="Compute --show-next run times after this local time "
-                          "instead of now")
-    args = ap.parse_args()
+                    help="Compute --show-next run times (and DST checks) from this local time instead of now")
+    ap.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    args = ap.parse_args(argv)
     start = None
     if args.start:
         try:
             start = datetime.datetime.strptime(args.start.strip(), "%Y-%m-%d %H:%M")
         except ValueError:
             ap.error(f"--from must look like '2026-01-31 23:59', got '{args.start}'")
+    if args.show_next < 0:
+        ap.error("--show-next must be >= 0")
+
+    default_tz = args.tz or os.environ.get("TZ") or None
+    if default_tz and default_tz.startswith(":"):
+        default_tz = default_tz[1:]
+    if args.tz and load_zone(args.tz) is None:
+        ap.error(f"unknown time zone '{args.tz}' (or this Python has no zoneinfo/tzdata; needs 3.9+)")
 
     lines = []
+    source = None
+    if sum(bool(x) for x in (args.file, args.expression, args.oncalendar)) > 1:
+        ap.error("give one of: an expression, --file or --oncalendar")
     if args.file:
         try:
             with open(args.file) as f:
                 lines = f.readlines()
         except (OSError, UnicodeDecodeError) as e:
             ap.error(f"can't read --file {args.file}: {e}")
+    elif args.oncalendar:
+        try:
+            lines = [oncalendar_to_cron(args.oncalendar) + " noop"]
+        except CronFieldError as e:
+            return _emit(args, [], {"errors": [f"OnCalendar: {e}"], "warnings": []}, code=1)
+        source = "OnCalendar=" + args.oncalendar
     elif args.expression:
         parts = args.expression.split()
         if len(parts) == 1 and parts[0].startswith("@"):
@@ -416,39 +668,87 @@ def main():
         elif len(parts) == 5:
             parts.append("noop")
         elif len(parts) < 5 and not (parts and parts[0].startswith("@")):
-            print(f"error: need at least 5 cron fields, got {len(parts)}",
-                  file=sys.stderr)
-            sys.exit(1)
+            return _emit(args, [], {"errors": [f"need at least 5 cron fields, got {len(parts)}"], "warnings": []},
+                         code=1)
         lines = [" ".join(parts)]
     else:
         ap.print_help(sys.stderr)
-        sys.exit(2)
+        return 2
 
     results = {"errors": [], "warnings": []}
     jobs = []
+    tz = default_tz
     for i, line in enumerate(lines, start=1):
+        m = re.match(r"\s*(CRON_TZ|TZ)\s*=\s*['\"]?([^'\"\s]+)", line)
+        if m:
+            tz = m.group(2)
+            if load_zone(tz) is None:
+                results["warnings"].append(f"line {i}: {m.group(1)}={tz} is not a time zone this Python knows "
+                                           f"(DST checks skipped; needs Python 3.9+ with tzdata)")
+            continue
         job = analyze_line(line, i, results)
         if job:
+            job["tz"] = tz
             jobs.append(job)
 
     compute_overlaps(jobs, results)
+
+    for job in jobs:
+        job["description"] = describe(job["fields"])
+        if job["has_errors"]:
+            continue
+        zone = load_zone(job["tz"]) if job["tz"] else None
+        if zone is not None:
+            seen = set()
+            for kind, t in dst_issues(job["fields"], zone, start):
+                key = (kind, t.strftime("%H:%M"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if kind == "gap":
+                    results["warnings"].append(
+                        f"line {job['line_no']}: {t:%H:%M} does not exist on {t:%Y-%m-%d} in {job['tz']} "
+                        f"(clocks jump forward for DST) -- depending on the cron daemon the run is skipped "
+                        f"or moved; schedule outside the transition hour to be safe")
+                else:
+                    results["warnings"].append(
+                        f"line {job['line_no']}: {t:%H:%M} happens twice on {t:%Y-%m-%d} in {job['tz']} "
+                        f"(clocks go back for DST) -- some cron daemons run the job twice")
+        if args.show_next:
+            job["next"] = [r.isoformat(sep=" ") for r in next_n_runs(job["fields"], args.show_next, start=start)]
+
+    code = 1 if (results["errors"] or not jobs) else 0
+    return _emit(args, jobs, results, code, source)
+
+
+def _emit(args, jobs, results, code, source=None):
+    if args.json:
+        print(json.dumps({
+            "version": __version__, "exit_code": code, "source": source,
+            "jobs": [{"line": j["line_no"], "schedule": " ".join(j["fields"]), "command": j["command"],
+                      "description": j.get("description"), "time_zone": j.get("tz"), "ok": not j["has_errors"],
+                      "next": j.get("next")} for j in jobs],
+            "errors": results["errors"], "warnings": results["warnings"]}, indent=2))
+        return code
 
     if not jobs:
         print("No valid cron job lines found to analyze.")
         for e in results["errors"]:
             print(f"  ✗ {e}")
-        sys.exit(1)
-
+        return code
+    if source:
+        print(f"{source}  =  cron '{' '.join(jobs[0]['fields'])}'")
     for job in jobs:
         status = "ERROR" if job["has_errors"] else "ok"
-        print(f"[{status}] line {job['line_no']}: "
-              f"{' '.join(job['fields'])}  ->  {job['command']}")
-        if args.show_next and not job["has_errors"]:
-            runs = next_n_runs(job["fields"], args.show_next, start=start)
-            for r in runs:
-                print(f"    next: {r.isoformat(sep=' ')}")
-            if len(runs) < args.show_next:
-                print(f"    (only {len(runs)} run(s) in the next {HORIZON_YEARS} years)")
+        tz = f"  [{job['tz']}]" if job.get("tz") else ""
+        print(f"[{status}] line {job['line_no']}: {' '.join(job['fields'])}  ->  {job['command']}{tz}")
+        if job.get("description"):
+            print(f"    {job['description']}")
+        if "next" in job:
+            for r in job["next"]:
+                print(f"    next: {r}")
+            if len(job["next"]) < args.show_next:
+                print(f"    (only {len(job['next'])} run(s) in the next {HORIZON_YEARS} years)")
 
     if results["errors"]:
         print("\nERRORS:")
@@ -458,12 +758,10 @@ def main():
         print("\nWARNINGS:")
         for w in results["warnings"]:
             print(f"  ! {w}")
-
     if not results["errors"] and not results["warnings"]:
         print("\nNo issues found.")
-
-    sys.exit(1 if results["errors"] else 0)
+    return code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

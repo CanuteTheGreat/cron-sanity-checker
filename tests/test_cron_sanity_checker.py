@@ -6,6 +6,7 @@ the schedule math is compared with real cron semantics rather than with
 expectations written by hand.
 """
 import datetime
+import json
 import os
 import subprocess
 import sys
@@ -69,7 +70,7 @@ class TestErrors(unittest.TestCase):
     def test_wrong_field_count(self):
         p = run("0 0 * *")
         self.assertEqual(p.returncode, 1)
-        self.assertIn("need at least 5 cron fields", p.stderr)
+        self.assertIn("need at least 5 cron fields", p.stdout)
         path = crontab("0 0 * *\n")
         try:
             p = run("--file", path)
@@ -194,11 +195,130 @@ class TestCli(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("No valid cron job lines found", p.stdout)
 
+    def test_version(self):
+        p = run("--version")
+        self.assertRegex(p.stdout, r"^cron-sanity-checker \d+\.\d+\.\d+$")
+
     def test_help(self):
         p = run("--help")
         self.assertEqual(p.returncode, 0)
-        for opt in ("--file", "--show-next", "--from"):
+        for opt in ("--file", "--show-next", "--from", "--json", "--tz", "--oncalendar"):
             self.assertIn(opt, p.stdout)
+
+
+HAS_ZONEINFO = sys.version_info >= (3, 9)
+
+
+class TestDescribe(unittest.TestCase):
+    CASES = {
+        "* * * * *": "Every minute",
+        "*/5 * * * *": "Every 5 minutes",
+        "0 * * * *": "Every hour, on the hour",
+        "15,45 * * * *": "At minute 15 and 45 past every hour",
+        "30 2 * * 1-5": "At 02:30 on Monday through Friday",
+        "0 0 1 1 *": "At 00:00 on the 1st of the month in January",
+        "0 */6 * * *": "At 00:00, 06:00, 12:00 and 18:00",
+        "15,45 9-17 1,15 * *": "At minute 15 and 45 past hour 9 through 17 on the 1st and 15th of the month",
+        "0 9 13 * 5": "At 09:00 on the 13th of the month or on Friday",
+        "*/10 8-18 * * 1-5": "Every 10 minutes past hour 8 through 18 on Monday through Friday",
+        "0 0 22 * 0,6": "At 00:00 on the 22nd of the month or on Sunday and Saturday",
+    }
+
+    def test_descriptions(self):
+        for expr, want in self.CASES.items():
+            with self.subTest(expr=expr):
+                p = run(expr)
+                self.assertEqual(p.returncode, 0, p.stdout)
+                self.assertEqual(p.stdout.splitlines()[1].strip(), want, p.stdout)
+
+    def test_no_description_for_unparseable(self):
+        p = run("0 noon * * *")
+        self.assertEqual(p.returncode, 1)
+        self.assertNotIn("Traceback", p.stderr)
+
+
+class TestJson(unittest.TestCase):
+    def test_json_output(self):
+        p = run("*/15 * * * *", "--json", "--show-next", "3", "--from", START)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        d = json.loads(p.stdout)
+        self.assertEqual(d["exit_code"], 0)
+        job = d["jobs"][0]
+        self.assertEqual(job["schedule"], "*/15 * * * *")
+        self.assertEqual(job["description"], "Every 15 minutes")
+        want = croniter("*/15 * * * *", datetime.datetime.strptime(START, "%Y-%m-%d %H:%M"))
+        self.assertEqual(job["next"], [want.get_next(datetime.datetime).isoformat(sep=" ") for _ in range(3)])
+        p = run("0 0 31 4 *", "--json")
+        self.assertEqual(p.returncode, 1)
+        d = json.loads(p.stdout)
+        self.assertFalse(d["jobs"][0]["ok"])
+        self.assertTrue(any("can never occur" in e for e in d["errors"]))
+        p = run("0 0 * *", "--json")
+        self.assertEqual(json.loads(p.stdout)["jobs"], [])
+
+
+class TestOnCalendar(unittest.TestCase):
+    def test_translations_match_cron(self):
+        for spec, cron in (("daily", "0 0 * * *"), ("hourly", "0 * * * *"), ("weekly", "0 0 * * 1"),
+                           ("monthly", "0 0 1 * *"), ("quarterly", "0 0 1 1,4,7,10 *"),
+                           ("Mon..Fri *-*-* 02:30", "30 2 * * 1-5"), ("Sat,Sun 10:00", "0 10 * * 6,0"),
+                           ("*-*-* *:0/15", "0-59/15 * * * *"), ("*-02-29 12:00:00", "0 12 29 2 *"),
+                           ("*-*-01..07 03:00", "0 3 1-7 * *")):
+            with self.subTest(spec=spec):
+                p = run("--oncalendar", spec, "--json", "--show-next", "4", "--from", START)
+                d = json.loads(p.stdout)
+                self.assertEqual(d["jobs"][0]["schedule"], cron)
+                it = croniter(cron, datetime.datetime.strptime(START, "%Y-%m-%d %H:%M"))
+                self.assertEqual(d["jobs"][0]["next"], [it.get_next(datetime.datetime).isoformat(sep=" ") for _ in range(4)])
+        p = run("--oncalendar", "Mon..Fri *-*-* 02:30")
+        self.assertIn("OnCalendar=Mon..Fri *-*-* 02:30  =  cron '30 2 * * 1-5'", p.stdout)
+
+    def test_untranslatable_specs_are_errors(self):
+        for spec, needle in (("*-*-* 00:00:30", "seconds"), ("2027-01-01 00:00", "year"),
+                             ("*-*~01 00:00", "can't parse"), ("Funday 00:00", "unknown OnCalendar weekday")):
+            with self.subTest(spec=spec):
+                p = run("--oncalendar", spec)
+                self.assertEqual(p.returncode, 1, p.stdout)
+                self.assertIn(needle, p.stdout)
+        self.assertEqual(run("--oncalendar", "daily", "0 0 * * *").returncode, 2)
+
+
+class TestTimeZones(unittest.TestCase):
+    def test_dst_gap_and_overlap(self):
+        p = run("30 2 * * *", "--tz", "America/New_York", "--from", "2026-01-01 00:00")
+        if not HAS_ZONEINFO:
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("needs 3.9+", p.stderr)
+            return
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn("02:30 does not exist on 2026-03-08 in America/New_York", p.stdout)
+        p = run("30 1 * * *", "--tz", "America/New_York", "--from", "2026-01-01 00:00")
+        self.assertIn("01:30 happens twice on 2026-11-01 in America/New_York", p.stdout)
+        # weekdays only: the US transitions are on Sundays, so nothing to warn about
+        p = run("30 2 * * 1-5", "--tz", "America/New_York", "--from", "2026-01-01 00:00")
+        self.assertIn("No issues found.", p.stdout)
+        # UTC has no DST; outside the transition hour is fine
+        self.assertIn("No issues found.", run("30 2 * * *", "--tz", "UTC").stdout)
+        self.assertIn("No issues found.", run("0 12 * * *", "--tz", "Europe/Berlin").stdout)
+
+    def test_cron_tz_lines_in_file(self):
+        path = crontab("CRON_TZ=Europe/London\n30 1 * * * job-a\nTZ=UTC\n30 1 * * * job-b\n")
+        try:
+            p = run("--file", path, "--from", "2026-01-01 00:00", "--json")
+        finally:
+            os.unlink(path)
+        d = json.loads(p.stdout)
+        if not HAS_ZONEINFO:
+            self.assertTrue(any("not a time zone this Python knows" in w for w in d["warnings"]))
+            return
+        self.assertEqual([j["time_zone"] for j in d["jobs"]], ["Europe/London", "UTC"])
+        self.assertEqual(sorted(w.split(":", 1)[0] for w in d["warnings"]), ["line 2", "line 2"])
+        self.assertTrue(any("does not exist on 2026-03-29 in Europe/London" in w for w in d["warnings"]))
+        self.assertTrue(any("happens twice on 2026-10-25 in Europe/London" in w for w in d["warnings"]))
+
+    def test_bad_zone_is_usage_error(self):
+        p = run("* * * * *", "--tz", "Mars/Olympus_Mons")
+        self.assertEqual(p.returncode, 2)
 
 
 if __name__ == "__main__":
