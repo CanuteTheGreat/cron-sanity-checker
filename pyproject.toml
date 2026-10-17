@@ -45,4 +45,4 @@ only-include = ["cron_sanity_checker.py", "README.md", "LICENSE", "CHANGELOG.md"
 [tool.mutmut]
 source_paths = ["cron_sanity_checker.py"]
 pytest_add_cli_args_test_selection = ["tests/"]
-also_copy = ["claims.json", "ci/check_claims.py", "README.md", "CHANGELOG.md"]
+also_copy = ["claims.json", "ci", "README.md", "CHANGELOG.md"]
