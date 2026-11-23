@@ -2,6 +2,13 @@
 
 All notable changes. Versions are git tags; each tag has a Forgejo release with checksums.
 
+## 1.3.0 - 2026-11-23
+
+- Shared CLI contract across the Errant Solutions tools ([docs/CLI-CONTRACT.md](docs/CLI-CONTRACT.md)): exit 0 clean, 1 findings, 2 usage/input error, 3 unexpected runtime error (an uncaught exception used to be a traceback with exit 1). Exit codes this tool already documented for other cases are kept and marked legacy in the README.
+- New `--quiet` / `-q`: no stdout, exit code only (errors stay on stderr).
+- `--json` now carries `schema_version` (1), `tool` and `exit_code` next to the existing keys (nothing removed or renamed).
+- The JSON Schema of the `--json` output is in `schema/`; contract tests (exit codes, JSON against the schema, quiet, stderr) run on every push, and the push trigger now covers every branch.
+
 ## 1.2.1 - 2026-10-17
 
 - Day-of-month/day-of-week matching now follows Vixie cron/cronie exactly: a day field that *starts with* `*` (e.g. `*/2`) makes cron AND the two fields, so `0 0 */2 * 1` runs only on odd-dated Mondays. Next-run times, the OR warning, never-fires detection and descriptions were wrong for these schedules.

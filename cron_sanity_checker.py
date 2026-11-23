@@ -31,11 +31,13 @@ Usage:
 Schedule macros (@yearly/@annually/@monthly/@weekly/@daily/@midnight/@hourly) are
 expanded and checked; @reboot lines and VAR=value lines are skipped.
 
-Exit codes: 0 = no errors (warnings still possible), 1 = at least one error found
-(or no job lines), 2 = usage error (no input, unreadable --file, bad --from).
+Exit codes (shared CLI contract, docs/CLI-CONTRACT.md): 0 = no errors (warnings still
+possible), 1 = at least one error found (or no job lines), 2 = usage error (no input,
+unreadable --file, bad --from), 3 = unexpected runtime error. --json prints one object with
+schema_version, tool, version and exit_code; --quiet prints nothing on stdout.
 """
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 import argparse
 import calendar
@@ -622,10 +624,19 @@ def dst_issues(fields, zone, start=None, days=400):
 
 
 def main(argv=None):
+    """Entry point. Any unexpected exception is a runtime error (exit 3), never a bare traceback exit 1."""
+    try:
+        return _main(argv)
+    except Exception as exc:  # SystemExit (argparse usage errors, exit 2) is not an Exception
+        print("cron-sanity-checker: error: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
+        return 3
+
+
+def _main(argv=None):
     ap = argparse.ArgumentParser(
         prog="cron-sanity-checker",
         description="Sanity-check cron schedule expressions for common footguns.",
-        epilog="Exit codes: 0 no errors (warnings possible), 1 at least one error (or no job lines), 2 usage error.")
+        epilog="Exit codes: 0 no errors (warnings possible), 1 at least one error (or no job lines), 2 usage error, 3 unexpected error.")
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     ap.add_argument("expression", nargs="?",
                     help="A single cron expression, quoted, e.g. '*/5 * * * *' "
@@ -644,6 +655,8 @@ def main(argv=None):
     ap.add_argument("--from", dest="start", metavar="'YYYY-MM-DD HH:MM'",
                     help="Compute --show-next run times (and DST checks) from this local time instead of now")
     ap.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    ap.add_argument("-q", "--quiet", action="store_true",
+                    help="print nothing on stdout; the exit code (and errors on stderr) are the result")
     args = ap.parse_args(argv)
     start = None
     if args.start:
@@ -737,8 +750,11 @@ def main(argv=None):
 
 
 def _emit(args, jobs, results, code, source=None):
+    if args.quiet:
+        return code
     if args.json:
         print(json.dumps({
+            "schema_version": 1, "tool": "cron-sanity-checker",
             "version": __version__, "exit_code": code, "source": source,
             "jobs": [{"line": j["line_no"], "schedule": " ".join(j["fields"]), "command": j["command"],
                       "description": j.get("description"), "time_zone": j.get("tz"), "ok": not j["has_errors"],

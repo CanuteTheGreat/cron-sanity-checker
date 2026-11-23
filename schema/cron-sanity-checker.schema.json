@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "cron-sanity-checker --json output (schema_version 1)",
+  "type": "object",
+  "required": ["schema_version", "tool", "version", "exit_code", "jobs", "errors", "warnings"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "tool": {"type": "string", "const": "cron-sanity-checker"},
+    "version": {"type": "string"},
+    "exit_code": {"type": "integer", "enum": [0, 1]},
+    "source": {"type": ["string", "null"]},
+    "jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["line", "schedule", "command", "ok"],
+        "properties": {
+          "line": {"type": "integer"},
+          "schedule": {"type": "string"},
+          "command": {"type": "string"},
+          "description": {"type": ["string", "null"]},
+          "time_zone": {"type": ["string", "null"]},
+          "ok": {"type": "boolean"},
+          "next": {"type": ["array", "null"], "items": {"type": "string"}}
+        }
+      }
+    },
+    "errors": {"type": "array", "items": {"type": "string"}},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}

@@ -35,7 +35,7 @@ A plain `crontab -e` syntax check won't catch any of these — this tool does:
 
 ```sh
 pipx install git+https://git.canutethegreat.com/CanuteTheGreat/cron-sanity-checker.git        # latest release branch; puts `cron-sanity-checker` on PATH
-pipx install git+https://git.canutethegreat.com/CanuteTheGreat/cron-sanity-checker.git@v1.2.1  # a pinned release
+pipx install git+https://git.canutethegreat.com/CanuteTheGreat/cron-sanity-checker.git@v1.3.0  # a pinned release
 brew install canutethegreat/errant-tools/cron-sanity-checker   # after: brew tap canutethegreat/errant-tools https://git.canutethegreat.com/CanuteTheGreat/homebrew-errant-tools
 scoop install errant-tools/cron-sanity-checker                 # after: scoop bucket add errant-tools https://git.canutethegreat.com/CanuteTheGreat/scoop-errant-tools
 ```
@@ -51,6 +51,7 @@ Not on PyPI yet, so plain `pipx install cron-sanity-checker` doesn't work until 
 ```
 cron-sanity-checker "*/5 * * * *"
 cron-sanity-checker --file /etc/crontab
+cron-sanity-checker --quiet "30 2 * * *"            # exit code only
 cron-sanity-checker --file mycrontab --show-next 5 --json
 cron-sanity-checker "30 2 * * *" --tz America/New_York        # DST gap warning
 cron-sanity-checker --oncalendar "Mon..Fri *-*-* 02:30"
@@ -62,11 +63,15 @@ day-of-week OR'd when both are set, `5/15` = `5-59/15`); `--from` computes them 
 given local time instead of now. Schedule macros (`@yearly`, `@annually`, `@monthly`,
 `@weekly`, `@daily`, `@midnight`, `@hourly`) are expanded and checked; `@reboot` and
 `VAR=value` lines are skipped (`CRON_TZ=`/`TZ=` set the zone for the lines after them).
-`--json` prints `{"version", "exit_code", "jobs": [{"line", "schedule", "command",
+`--json` prints `{"schema_version", "tool", "version", "exit_code", "source", "jobs": [{"line", "schedule", "command",
 "description", "time_zone", "ok", "next"}], "errors", "warnings"}`. Python 3.8+.
 
-Exit codes: `0` = no errors (warnings still possible), `1` = at least one error found
-(or no job lines), `2` = usage error (no input, unreadable `--file`, bad `--from`/`--tz`).
+`--quiet` (`-q`) prints nothing on stdout, so the exit code is the whole answer. Errors always go to stderr.
+`--json` carries `schema_version` (currently 1); its JSON Schema is
+[schema/cron-sanity-checker.schema.json](schema/cron-sanity-checker.schema.json).
+
+Exit codes (the shared Errant Solutions CLI contract, see [docs/CLI-CONTRACT.md](docs/CLI-CONTRACT.md)): `0` = no errors (warnings still possible), `1` = at least one error found
+(or no job lines), `2` = usage error (no input, unreadable `--file`, bad `--from`/`--tz`), `3` = unexpected runtime error.
 
 ## Example
 
