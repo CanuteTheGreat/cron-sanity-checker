@@ -138,5 +138,7 @@ EOF
 if [ $rc = 0 ]; then
   mkdir -p .mutation-baseline
   docker cp "$NAME:/src/.mutation-baseline/$MUT_ID" .mutation-baseline/ 2>/dev/null || true
+  # publish it to the shared store branch from the host (the container's gate cannot push: no credentials)
+  python3 ci/mutation-incremental.py publish --id "$MUT_ID" || true
 fi
 exit $rc

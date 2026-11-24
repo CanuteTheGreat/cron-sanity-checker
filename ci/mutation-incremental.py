@@ -525,6 +525,8 @@ def main():
     m.add_argument("--diff", required=True)
     m.add_argument("--mutants", default="mutants")
     m.add_argument("--sample", type=int, default=1)
+    u = sub.add_parser("publish")
+    u.add_argument("--id", required=True)
     g = sub.add_parser("gate")
     g.add_argument("--id", required=True)
     g.add_argument("--kind", required=True, choices=["cargo", "pit", "mutmut"])
@@ -539,6 +541,11 @@ def main():
         cmd_plan(a)
     elif a.cmd == "mutmut-targets":
         cmd_mutmut_targets(a)
+    elif a.cmd == "publish":
+        # host side, after the gate ran in the container: the container has no GITHUB_ACTIONS/credentials,
+        # so its store_push is a silent no-op and the store branch never saw the new baseline
+        if load(a.id):
+            store_push(a.id)
     else:
         cmd_gate(a)
 
