@@ -1,6 +1,6 @@
 {
  "id": "cron-sanity-checker",
- "last_full": "2026-11-24",
+ "last_full": "2026-11-25",
  "sha": "bf8d46dde42996d9d897345d46b0cc20dd2b0284",
  "survivors": [
   "cron_sanity_checker.x__emit__mutmut_117",
